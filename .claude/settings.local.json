@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show sounddevice soundfile ffmpeg-python 2>&1 | head -30)",
+      "Bash(pip install sounddevice soundfile 2>&1 | tail -5)",
+      "Bash(where ffmpeg 2>&1)"
+    ]
+  }
+}
