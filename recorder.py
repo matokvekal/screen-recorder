@@ -11,6 +11,7 @@ import subprocess
 import os
 import time
 import tkinter as tk
+import whisper
 
 # --- Drag to select screen region ---
 def select_region():
@@ -173,6 +174,15 @@ if audio_frames:
     os.remove(video_tmp)
     os.remove(audio_tmp)
     print(f"Saved: {output_file}")
+
+    # --- Transcribe audio with Whisper ---
+    print("Transcribing audio... (first run downloads model ~145MB)")
+    model = whisper.load_model("base")
+    result = model.transcribe(output_file)
+    transcript_file = output_file.replace(".mp4", ".txt")
+    with open(transcript_file, "w", encoding="utf-8") as f:
+        f.write(result["text"].strip())
+    print(f"Transcript saved: {transcript_file}")
 else:
     os.rename(video_tmp, output_file)
     print(f"Saved (no audio): {output_file}")
