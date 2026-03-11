@@ -1,17 +1,22 @@
+import sys
+import os
+
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w')
+
 import ctypes
 ctypes.windll.shcore.SetProcessDpiAwareness(2)
 
-import cv2
-import numpy as np
 import mss
+import numpy as np
 import sounddevice as sd
-import soundfile as sf
-import threading
 import subprocess
-import os
+import threading
+import wave
 import time
 import tkinter as tk
-import whisper
 
 # --- Drag to select screen region ---
 def select_region():
@@ -46,7 +51,6 @@ def select_region():
     canvas.bind("<ButtonPress-1>", on_press)
     canvas.bind("<B1-Motion>", on_drag)
     canvas.bind("<ButtonRelease-1>", on_release)
-
     root.mainloop()
 
     x1, x2 = min(coords["x1"], coords["x2"]), max(coords["x1"], coords["x2"])
@@ -56,7 +60,6 @@ def select_region():
 # --- Floating timer window ---
 def show_timer(stop_event):
     root = tk.Tk()
-    root.title("Recording")
     root.attributes("-topmost", True)
     root.attributes("-alpha", 0.85)
     root.overrideredirect(True)
@@ -76,13 +79,10 @@ def show_timer(stop_event):
                            fg="white", bg="#1a1a1a")
     timer_label.pack(side=tk.LEFT, padx=6)
 
-    def on_stop():
-        stop_event.set()
-
     stop_btn = tk.Button(frame, text="⏹ Stop", font=("Arial", 11, "bold"),
                          fg="white", bg="#c0392b", activebackground="#e74c3c",
                          activeforeground="white", relief=tk.FLAT, padx=8, pady=2,
-                         command=on_stop)
+                         command=stop_event.set)
     stop_btn.pack(fill=tk.X, pady=(4, 0))
 
     start = time.time()
@@ -92,21 +92,17 @@ def show_timer(stop_event):
             root.destroy()
             return
         elapsed = int(time.time() - start)
-        h = elapsed // 3600
-        m = (elapsed % 3600) // 60
-        s = elapsed % 60
-        timer_label.config(text=f"{h:02d}:{m:02d}:{s:02d}")
+        timer_label.config(text=f"{elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}")
         root.after(500, update)
 
     update()
     root.mainloop()
 
 
+# --- Setup ---
 print("Drag to select the recording area...")
 x1, y1, x2, y2 = select_region()
-
-width = x2 - x1
-height = y2 - y1
+width, height = x2 - x1, y2 - y1
 
 fps = 20
 video_tmp = "tmp_video.mp4"
@@ -131,35 +127,48 @@ def record_audio():
 audio_thread = threading.Thread(target=record_audio, daemon=True)
 audio_thread.start()
 
-# --- Timer in background thread ---
+# --- Timer ---
 timer_thread = threading.Thread(target=show_timer, args=(stop_event,), daemon=True)
 timer_thread.start()
 
-# --- Video recording ---
-fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-out = cv2.VideoWriter(video_tmp, fourcc, fps, (width, height))
-
-monitor = {"top": y1, "left": x1, "width": width, "height": height}
+# --- Video: pipe raw BGRA frames to ffmpeg ---
+ffmpeg_video = subprocess.Popen([
+    "ffmpeg", "-y",
+    "-f", "rawvideo", "-vcodec", "rawvideo",
+    "-s", f"{width}x{height}",
+    "-pix_fmt", "bgra",
+    "-r", str(fps),
+    "-i", "pipe:0",
+    "-vcodec", "libx264",
+    "-pix_fmt", "yuv420p",
+    "-preset", "ultrafast",
+    video_tmp
+], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 print("Recording... Press CTRL+C to stop")
 
 with mss.mss() as sct:
+    monitor = {"top": y1, "left": x1, "width": width, "height": height}
     try:
         while not stop_event.is_set():
-            img = np.array(sct.grab(monitor))
-            frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            out.write(frame)
+            ffmpeg_video.stdin.write(sct.grab(monitor).raw)
     except KeyboardInterrupt:
         stop_event.set()
 
-out.release()
+ffmpeg_video.stdin.close()
+ffmpeg_video.wait()
 stop_event.set()
 audio_thread.join()
 
-# --- Save audio ---
+# --- Save audio as WAV (built-in wave module, no soundfile needed) ---
 if audio_frames:
-    audio_data = np.concatenate(audio_frames, axis=0)
-    sf.write(audio_tmp, audio_data, SAMPLE_RATE)
+    audio_data = np.concatenate(audio_frames).astype(np.float32)
+    audio_int16 = (audio_data * 32767).astype(np.int16)
+    with wave.open(audio_tmp, 'wb') as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(audio_int16.tobytes())
 
     subprocess.run([
         "ffmpeg", "-y",
@@ -169,20 +178,11 @@ if audio_frames:
         "-c:a", "aac",
         "-shortest",
         output_file
-    ], check=True)
+    ], check=True, stderr=subprocess.DEVNULL)
 
     os.remove(video_tmp)
     os.remove(audio_tmp)
-    print(f"Saved: {output_file}")
-
-    # --- Transcribe audio with Whisper ---
-    print("Transcribing audio... (first run downloads model ~145MB)")
-    model = whisper.load_model("base")
-    result = model.transcribe(output_file)
-    transcript_file = output_file.replace(".mp4", ".txt")
-    with open(transcript_file, "w", encoding="utf-8") as f:
-        f.write(result["text"].strip())
-    print(f"Transcript saved: {transcript_file}")
 else:
     os.rename(video_tmp, output_file)
-    print(f"Saved (no audio): {output_file}")
+
+print(f"Saved: {output_file}")
